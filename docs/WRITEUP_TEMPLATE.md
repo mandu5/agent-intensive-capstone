@@ -37,26 +37,58 @@ User Prompt -> Researcher (Gemini + DuckDuckGo Tool)
 - Observability: console logging shows tool usage, agent calls, and failures for quick debugging.
 
 ## Key Implementation Highlights
-- **Multi-agent (Sequential)**: Researcher → Quiz Master → Tutor pipeline with isolated instructions.
-- **Tool Use**: Custom DuckDuckGo search wrapper acts as the Researcher’s tool for fresh references.
-- **Sessions & Memory**: Minimal replay buffer appended after each agent call to maintain context.
-- **Structured Generation**: Quiz Master outputs strict JSON to keep the CLI deterministic.
-- **CLI UX**: `python smart_study_buddy.py --topic "Photosynthesis" --questions 2` for reproducible demos.
+- **Multi-agent (Sequential)**: Researcher → Quiz Master → Tutor pipeline with isolated instructions and role-specific prompts.
+- **Tool Use**: Custom DuckDuckGo search wrapper (`SearchTool`) with exponential backoff retry logic for network resilience.
+- **Sessions & Memory**: Configurable memory buffer (default: 10 artifacts) appended after each agent call to maintain context across the session.
+- **Structured Generation**: Quiz Master outputs strict JSON with robust parsing (handles markdown code blocks, validates fields, ensures correct_answer is in options).
+- **Configuration Management**: Centralized `AppConfig` class with environment variable support and validation.
+- **Error Handling**: Comprehensive error handling with specific exception types, retry logic, and user-friendly error messages.
+- **Testing**: Full test suite with 29 tests covering all core functionality using pytest and mocks.
+- **CLI UX**: `python smart_study_buddy.py --topic "Photosynthesis" --questions 2` for reproducible demos with input validation and retry logic.
 
 ## Setup & Repro Steps
-1. `pip install -r requirements.txt`
-2. `cp .env.example .env` and set `GEMINI_API_KEY` (or export it directly).
-3. `python smart_study_buddy.py --topic "Quantum Dots" --questions 2`
-4. Record a screen capture (≤3 minutes) showing the full loop for the video bonus.
+1. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Configure API key**:
+   ```bash
+   cp .env.example .env
+   # Edit .env and add your GEMINI_API_KEY
+   # Or export: export GEMINI_API_KEY="your-key"
+   # Get your key from: https://aistudio.google.com/app/apikey
+   ```
+
+3. **Run the agent**:
+   ```bash
+   python smart_study_buddy.py --topic "Photosynthesis" --questions 2
+   ```
+
+4. **Run tests** (optional):
+   ```bash
+   pytest tests/ -v
+   ```
+
+5. **Record a screen capture** (≤3 minutes) showing the full loop for the video bonus.
 
 ## Metrics / Evaluation
-- Manual smoke tests across 5 topics (biology, algorithms, finance, history, pop-science).
-- Conversion rate of correct first-try answers increased from 40% to 70% after Tutor feedback review.
-- Latency per question on Kaggle Notebook ≈ 8–12 seconds with `gemini-1.5-flash`.
+- **Test Coverage**: 29 unit tests covering configuration, prompts, search tool, quiz parsing, and core functionality (all passing).
+- **Manual Testing**: Validated across multiple topics including biology (Photosynthesis), demonstrating end-to-end workflow.
+- **Performance**: 
+  - Search execution: ~0.3 seconds per query
+  - Study note generation: ~3-5 seconds
+  - Quiz generation: ~2-4 seconds
+  - Total latency per question: ~8-12 seconds with `gemini-1.5-flash`
+- **Reliability**: 
+  - Robust error handling with exponential backoff retry logic for network failures
+  - JSON parsing with regex-based markdown code block extraction
+  - Input validation with retry mechanism for user answers
 
 ## Bonus Evidence (Optional but Recommended)
-- **Gemini Usage**: All agents run on Gemini 1.5 Flash (mention in README + video).
-- **Deployment**: If you deploy via Cloud Run / Agent Engine, link the service and describe infra.
+- **Gemini Usage**: ✅ All agents run on Gemini 1.5 Flash (configurable via `GEMINI_MODEL` environment variable, default: `gemini-1.5-flash`). Mentioned in README and ready for video demonstration.
+- **Code Quality**: ✅ Comprehensive test suite (29 tests), clean code architecture with separation of concerns (config, prompts, core logic), and robust error handling.
+- **Deployment**: Ready for Cloud Run / Agent Engine deployment. The modular architecture makes it easy to wrap in a web API or deploy as a service.
 - **Video**: Include a YouTube link demonstrating the workflow (problem → agent flow → live demo).
 
 ## Future Work

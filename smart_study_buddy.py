@@ -15,33 +15,32 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
+import re
+import time
 from dataclasses import dataclass
-from textwrap import dedent
 from typing import List, Optional
 
 from duckduckgo_search import DDGS
-from dotenv import load_dotenv
 import google.generativeai as genai
+
+from config import AppConfig
+from prompts import (
+    format_agent_prompt,
+    format_quiz_master_prompt,
+    format_researcher_prompt,
+    format_tutor_prompt,
+)
 
 # ----------------------------------------------------------------------------
 # Configuration & logging
 # ----------------------------------------------------------------------------
-load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 LOGGER = logging.getLogger("smart-study-buddy")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise EnvironmentError(
-        "GEMINI_API_KEY is not set. Use a .env file or export the variable first."
-    )
-
-genai.configure(api_key=GEMINI_API_KEY)
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# Configuration will be loaded in main() to avoid import-time errors in tests
 
 
 # ----------------------------------------------------------------------------
@@ -51,25 +50,63 @@ DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 class SearchTool:
     """Simple wrapper around DuckDuckGo Search to serve as an agent tool."""
 
-    max_results: int = 3
+    max_results: int
+    max_retries: int
+    retry_delay: float
 
     def run(self, query: str) -> str:
+        """
+        Execute a web search with retry logic.
+
+        Args:
+            query: Search query string
+
+        Returns:
+            Formatted search results or error message
+        """
         if not query:
             return "No query provided."
 
         LOGGER.info("[Tool] Searching web for '%s' (top %d results)", query, self.max_results)
-        snippets: List[str] = []
-        try:
-            with DDGS() as ddgs:
-                for row in ddgs.text(query, max_results=self.max_results):
-                    body = row.get("body") or ""
-                    title = row.get("title") or "Untitled"
-                    snippets.append(f"- {title}: {body}")
-        except Exception as err:  # pragma: no cover - network variances
-            LOGGER.warning("DuckDuckGo search failed: %s", err)
-            return f"Search failed: {err}"
 
-        return "\n".join(snippets) if snippets else "No public snippets were found."
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                snippets: List[str] = []
+                with DDGS() as ddgs:
+                    for row in ddgs.text(query, max_results=self.max_results):
+                        body = row.get("body") or ""
+                        title = row.get("title") or "Untitled"
+                        snippets.append(f"- {title}: {body}")
+
+                if snippets:
+                    return "\n".join(snippets)
+                return "No public snippets were found."
+
+            except (ConnectionError, TimeoutError) as err:
+                last_error = err
+                if attempt < self.max_retries:
+                    wait_time = self.retry_delay * (2 ** (attempt - 1))  # Exponential backoff
+                    LOGGER.warning(
+                        "Search attempt %d/%d failed: %s. Retrying in %.1f seconds...",
+                        attempt,
+                        self.max_retries,
+                        err,
+                        wait_time,
+                    )
+                    time.sleep(wait_time)
+                else:
+                    LOGGER.error("All search attempts failed after %d retries", self.max_retries)
+
+            except Exception as err:  # pragma: no cover - network variances
+                LOGGER.warning("DuckDuckGo search failed with unexpected error: %s", err)
+                return f"Search failed: {err}"
+
+        # If we get here, all retries failed
+        error_msg = f"Search failed after {self.max_retries} attempts"
+        if last_error:
+            error_msg += f": {last_error}"
+        return error_msg
 
 
 # ----------------------------------------------------------------------------
@@ -81,7 +118,7 @@ class Agent:
 
     name: str
     instructions: str
-    model_name: str = DEFAULT_MODEL
+    model_name: str
     response_mime_type: str = "text/plain"
 
     def __post_init__(self) -> None:
@@ -91,18 +128,25 @@ class Agent:
         )
 
     def run(self, context: str, memory: Optional[List[str]] = None) -> str:
-        compiled_prompt = dedent(
-            f"""
-            You are the {self.name} agent.
-            Instructions: {self.instructions}
+        """
+        Execute the agent with given context and memory.
 
-            Session memory (may be empty):
-            {os.linesep.join(memory or []) or 'None yet.'}
-            ---
-            Focused input:
-            {context}
-            """
-        ).strip()
+        Args:
+            context: Current context/input for the agent
+            memory: Optional list of memory entries from previous interactions
+
+        Returns:
+            Agent response text
+
+        Raises:
+            Exception: If the agent call fails
+        """
+        compiled_prompt = format_agent_prompt(
+            agent_name=self.name,
+            instructions=self.instructions,
+            context=context,
+            memory=memory,
+        )
 
         try:
             response = self._model.generate_content(compiled_prompt)
@@ -127,9 +171,25 @@ class QuizItem:
 class SmartStudyBuddy:
     """Coordinates the tool + agents to deliver a study session."""
 
-    def __init__(self, search_tool: Optional[SearchTool] = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        search_tool: Optional[SearchTool] = None,
+    ) -> None:
+        """
+        Initialize Smart Study Buddy with configuration.
+
+        Args:
+            config: Application configuration
+            search_tool: Optional search tool instance (uses config defaults if not provided)
+        """
+        self.config = config
         self.memory: List[str] = []
-        self.search_tool = search_tool or SearchTool()
+        self.search_tool = search_tool or SearchTool(
+            max_results=config.default_max_results,
+            max_retries=config.search_max_retries,
+            retry_delay=config.search_retry_delay,
+        )
 
         self.researcher = Agent(
             name="Researcher",
@@ -137,6 +197,7 @@ class SmartStudyBuddy:
                 "Aggregate the most important definitions, core principles,"
                 " and real-world examples. Cite search snippets concisely."
             ),
+            model_name=config.gemini_model,
         )
         self.quiz_master = Agent(
             name="QuizMaster",
@@ -145,6 +206,7 @@ class SmartStudyBuddy:
                 " Respond with strict JSON containing keys question, options (list),"
                 " correct_answer, explanation."
             ),
+            model_name=config.gemini_model,
             response_mime_type="application/json",
         )
         self.tutor = Agent(
@@ -153,11 +215,18 @@ class SmartStudyBuddy:
                 "Evaluate the learner's answer, explain correctness, and add a follow-up tip."
                 " Encourage active recall and reference the study note when helpful."
             ),
+            model_name=config.gemini_model,
         )
 
     # --------------------------- public API ---------------------------
     def interactive_session(self, topic: str, questions: int = 1) -> None:
-        """Run an end-to-end study session via the terminal."""
+        """
+        Run an end-to-end study session via the terminal.
+
+        Args:
+            topic: Topic to study
+            questions: Number of quiz questions to generate
+        """
         study_note = self._generate_study_note(topic)
         LOGGER.info("Study note ready. Generating %d quiz question(s)...", questions)
 
@@ -173,11 +242,11 @@ class SmartStudyBuddy:
             for option_idx, option in enumerate(quiz.options, start=1):
                 print(f"  {option_idx}. {option}")
 
-            user_input = input("Your answer (number or text, 'q' to quit): ").strip()
-            if user_input.lower() == "q":
+            user_answer = self._get_user_answer(quiz.options)
+            if user_answer is None:  # User quit
                 break
 
-            normalized = self._normalize_answer(user_input, quiz.options)
+            normalized = self._normalize_answer(user_answer, quiz.options)
             feedback = self._grade_and_feedback(quiz, normalized, study_note)
             print("\nFeedback:\n" + feedback)
 
@@ -192,38 +261,45 @@ class SmartStudyBuddy:
 
     # -------------------------- internals ----------------------------
     def _remember(self, entry: str) -> None:
+        """
+        Add an entry to memory, maintaining the configured limit.
+
+        Args:
+            entry: Memory entry to add
+        """
         self.memory.append(entry)
         # Keep memory bounded to avoid prompt bloat
-        if len(self.memory) > 10:
-            self.memory = self.memory[-10:]
+        if len(self.memory) > self.config.memory_limit:
+            self.memory = self.memory[-self.config.memory_limit :]
 
     def _generate_study_note(self, topic: str) -> str:
-        search_digest = self.search_tool.run(topic)
-        context = dedent(
-            f"""
-            Topic: {topic}
-            Use the search digest as factual grounding. Provide:
-            - A brief overview
-            - 3-5 bullet points of core insights
-            - One memorable example or analogy
+        """
+        Generate a study note for the given topic.
 
-            Search digest:
-            {search_digest}
-            """
-        ).strip()
+        Args:
+            topic: Topic to research
+
+        Returns:
+            Generated study note
+        """
+        search_digest = self.search_tool.run(topic)
+        context = format_researcher_prompt(topic=topic, search_digest=search_digest)
 
         note = self.researcher.run(context, self.memory)
         self._remember(f"StudyNote::{note}")
         return note
 
     def _generate_quiz(self, study_note: str) -> Optional[QuizItem]:
-        context = dedent(
-            f"""
-            You must return valid JSON only.
-            Study note source:
-            {study_note}
-            """
-        ).strip()
+        """
+        Generate a quiz question from a study note.
+
+        Args:
+            study_note: Study note to generate quiz from
+
+        Returns:
+            QuizItem if successful, None otherwise
+        """
+        context = format_quiz_master_prompt(study_note=study_note)
 
         raw_response = self.quiz_master.run(context, self.memory)
         quiz = self._parse_quiz(raw_response)
@@ -234,23 +310,85 @@ class SmartStudyBuddy:
     def _grade_and_feedback(
         self, quiz: QuizItem, user_answer: Optional[str], study_note: str
     ) -> str:
-        context = dedent(
-            f"""
-            Question: {quiz.question}
-            Options: {quiz.options}
-            Correct Answer: {quiz.correct_answer}
-            Learner Answer: {user_answer or 'No answer provided'}
-            Study Note:
-            {study_note}
-            """
-        ).strip()
+        """
+        Grade user answer and generate feedback.
+
+        Args:
+            quiz: Quiz item with question and correct answer
+            user_answer: User's answer
+            study_note: Study note for reference
+
+        Returns:
+            Feedback string
+        """
+        context = format_tutor_prompt(
+            question=quiz.question,
+            options=quiz.options,
+            correct_answer=quiz.correct_answer,
+            user_answer=user_answer,
+            study_note=study_note,
+        )
 
         feedback = self.tutor.run(context, self.memory)
         self._remember(f"Feedback::{feedback}")
         return feedback
 
+    def _get_user_answer(self, options: List[str]) -> Optional[str]:
+        """
+        Get and validate user answer with retry logic.
+
+        Args:
+            options: List of available answer options
+
+        Returns:
+            User's answer string, or None if user quits
+        """
+        for attempt in range(1, self.config.max_input_retries + 1):
+            user_input = input(
+                f"Your answer (number or text, 'q' to quit) [{attempt}/{self.config.max_input_retries}]: "
+            ).strip()
+
+            if not user_input:
+                if attempt < self.config.max_input_retries:
+                    print("Please provide an answer or 'q' to quit.")
+                    continue
+                else:
+                    print("No answer provided. Moving to next question.")
+                    return None
+
+            if user_input.lower() == "q":
+                return None
+
+            # Validate numeric input
+            if user_input.isdigit():
+                idx = int(user_input) - 1
+                if 0 <= idx < len(options):
+                    return user_input
+                else:
+                    if attempt < self.config.max_input_retries:
+                        print(f"Please enter a number between 1 and {len(options)}.")
+                        continue
+                    else:
+                        print(f"Invalid number. Using '{user_input}' as text answer.")
+                        return user_input
+
+            # Text input is always accepted
+            return user_input
+
+        return None
+
     @staticmethod
     def _normalize_answer(user_input: str, options: List[str]) -> Optional[str]:
+        """
+        Normalize user input to match an option.
+
+        Args:
+            user_input: Raw user input
+            options: List of available options
+
+        Returns:
+            Normalized answer matching an option, or original input
+        """
         if not user_input:
             return None
 
@@ -267,30 +405,78 @@ class SmartStudyBuddy:
 
     @staticmethod
     def _parse_quiz(payload: str) -> Optional[QuizItem]:
+        """
+        Parse quiz JSON from agent response with robust error handling.
+
+        Args:
+            payload: Raw response from quiz master agent
+
+        Returns:
+            QuizItem if parsing succeeds, None otherwise
+        """
         if not payload:
             return None
 
+        # Step 1: Extract JSON from markdown code blocks using regex
         cleaned = payload.strip()
-        if "```" in cleaned:
-            cleaned = cleaned.split("```", 2)[-2] if cleaned.count("```") >= 2 else cleaned
-            cleaned = cleaned.replace("json", "", 1).strip()
 
+        # Match JSON in markdown code blocks (```json ... ``` or ``` ... ```)
+        code_block_pattern = r"```(?:json)?\s*\n?(.*?)\n?```"
+        matches = re.findall(code_block_pattern, cleaned, re.DOTALL | re.IGNORECASE)
+        if matches:
+            # Use the last match (most likely the actual JSON)
+            cleaned = matches[-1].strip()
+        else:
+            # If no code blocks, try to find JSON object boundaries
+            json_pattern = r"\{.*\}"
+            json_match = re.search(json_pattern, cleaned, re.DOTALL)
+            if json_match:
+                cleaned = json_match.group(0).strip()
+
+        # Step 2: Parse JSON
         try:
             data = json.loads(cleaned)
         except json.JSONDecodeError as exc:
             LOGGER.error("Quiz JSON parsing failed: %s\nPayload was:\n%s", exc, payload)
             return None
 
+        # Step 3: Validate and extract fields
         question = data.get("question")
         options = data.get("options", [])
         answer = data.get("correct_answer")
         explanation = data.get("explanation")
 
-        if not question or not options or not answer:
-            LOGGER.error("Quiz JSON missing fields: %s", data)
+        # Validate required fields
+        if not question or not isinstance(question, str):
+            LOGGER.error("Quiz JSON missing or invalid 'question' field: %s", data)
             return None
 
-        return QuizItem(question=question, options=options, correct_answer=answer, explanation=explanation)
+        if not options or not isinstance(options, list):
+            LOGGER.error("Quiz JSON missing or invalid 'options' field: %s", data)
+            return None
+
+        if len(options) < 2:
+            LOGGER.error("Quiz JSON 'options' must have at least 2 items: %s", data)
+            return None
+
+        if not answer or not isinstance(answer, str):
+            LOGGER.error("Quiz JSON missing or invalid 'correct_answer' field: %s", data)
+            return None
+
+        # Validate that correct_answer is in options
+        if answer not in options:
+            LOGGER.warning(
+                "Correct answer '%s' not found in options. Using first option as fallback.",
+                answer,
+            )
+            answer = options[0]
+
+        return QuizItem(
+            question=question,
+            options=options,
+            correct_answer=answer,
+            explanation=explanation,
+        )
 
 
 # ----------------------------------------------------------------------------
@@ -310,12 +496,33 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Main entry point for the CLI."""
+    # Load configuration (only when actually running, not during import)
+    try:
+        config = AppConfig.from_env()
+    except EnvironmentError as e:
+        LOGGER.error(str(e))
+        raise
+
+    # Configure Gemini API
+    genai.configure(api_key=config.gemini_api_key)
+
     args = parse_args()
     topic = args.topic or input("Enter a topic to study: ").strip()
     if not topic:
         raise ValueError("A topic is required to run the study buddy.")
 
-    buddy = SmartStudyBuddy(search_tool=SearchTool(max_results=args.max_results))
+    # Override config with CLI arguments if provided
+    if args.max_results:
+        config.default_max_results = args.max_results
+
+    search_tool = SearchTool(
+        max_results=config.default_max_results,
+        max_retries=config.search_max_retries,
+        retry_delay=config.search_retry_delay,
+    )
+
+    buddy = SmartStudyBuddy(config=config, search_tool=search_tool)
     buddy.interactive_session(topic=topic, questions=max(1, args.questions))
 
 
